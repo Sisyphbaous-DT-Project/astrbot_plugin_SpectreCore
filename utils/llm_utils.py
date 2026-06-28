@@ -5,6 +5,8 @@ import threading
 from .history_storage import HistoryStorage
 from .message_utils import MessageUtils
 from astrbot.core.provider.entites import ProviderRequest
+from astrbot.core.message.components import Reply
+from astrbot.core.utils.quoted_message import extract_quoted_message_images
 
 class LLMUtils:
     """
@@ -96,29 +98,44 @@ class LLMUtils:
             return LLMUtils._llm_call_status[chat_key].get("last_call_time")
     
     @staticmethod
-    async def call_llm(event: AstrMessageEvent, config: AstrBotConfig, context: Context) -> ProviderRequest:
-        """
-        构建调用大模型的请求对象
+    async def get_native_conversation(event: AstrMessageEvent, context: Context):
+        """获取 AstrBot 原生会话，让影芯触发和普通 @ 回复共用同一份上下文。"""
+        try:
+            conversation_manager = getattr(context, "conversation_manager", None)
+            if conversation_manager is None:
+                return None
 
-        Args:
-            event: 消息对象
-            config: 配置对象
-            context: Context 对象，用于获取LLM工具管理器
+            umo = event.unified_msg_origin
+            conversation_id = await conversation_manager.get_curr_conversation_id(umo)
+            if not conversation_id:
+                conversation_id = await conversation_manager.new_conversation(
+                    umo,
+                    event.get_platform_id(),
+                )
 
-        Returns:
-            ProviderRequest 对象
-        """
-        platform_name = event.get_platform_name()
-        is_private = event.is_private_chat()
-        chat_id = event.get_group_id() if not is_private else event.get_sender_id()
+            conversation = await conversation_manager.get_conversation(
+                umo,
+                conversation_id,
+            )
+            if conversation is None:
+                conversation_id = await conversation_manager.new_conversation(
+                    umo,
+                    event.get_platform_id(),
+                )
+                conversation = await conversation_manager.get_conversation(
+                    umo,
+                    conversation_id,
+                )
+            return conversation
+        except Exception as e:
+            logger.warning(f"获取 AstrBot 原生会话失败，将回退影芯轻量上下文: {e}")
+            return None
 
-        # 准备并调用大模型
-        func_tools_mgr = context.get_llm_tool_manager() if config.get("use_func_tool", False) else None
-
-        # 使用 AstrBot 原生 UMO 人格机制获取人格
+    @staticmethod
+    async def build_legacy_persona_context(context: Context, umo: str):
+        """原有影芯轻量人格上下文兜底，仅在拿不到 AstrBot 原生会话时使用。"""
         system_prompt = ""
         contexts = []
-        umo = event.unified_msg_origin
 
         try:
             # 遵循 AstrBot 原生人格获取优先级：
@@ -176,6 +193,64 @@ class LLMUtils:
         except Exception as e:
             logger.error(f"获取人格信息失败: {e}")
 
+        return system_prompt, contexts
+
+    @staticmethod
+    async def collect_quoted_image_urls(event: AstrMessageEvent) -> List[str]:
+        """收集当前消息引用中的图片，补齐主动回复链路对引用图的视觉输入。"""
+        image_urls: List[str] = []
+        try:
+            message_components = getattr(getattr(event, "message_obj", None), "message", [])
+            for component in message_components:
+                if not isinstance(component, Reply):
+                    continue
+                try:
+                    quoted_images = await extract_quoted_message_images(event, component)
+                except Exception as e:
+                    logger.warning(f"解析引用图片失败: {e}")
+                    continue
+
+                for url in quoted_images or []:
+                    if url and url not in image_urls:
+                        image_urls.append(url)
+        except Exception as e:
+            logger.warning(f"收集引用图片URL时出错: {e}")
+
+        return image_urls
+
+    @staticmethod
+    async def call_llm(event: AstrMessageEvent, config: AstrBotConfig, context: Context) -> ProviderRequest:
+        """
+        构建调用大模型的请求对象
+
+        Args:
+            event: 消息对象
+            config: 配置对象
+            context: Context 对象，用于获取LLM工具管理器
+
+        Returns:
+            ProviderRequest 对象
+        """
+        platform_name = event.get_platform_name()
+        is_private = event.is_private_chat()
+        chat_id = event.get_group_id() if not is_private else event.get_sender_id()
+
+        # 准备并调用大模型
+        func_tools_mgr = context.get_llm_tool_manager() if config.get("use_func_tool", False) else None
+
+        # 优先使用 AstrBot 原生会话：人格、工具、主会话历史和截断规则都交给 AstrBot 处理。
+        system_prompt = ""
+        contexts = []
+        umo = event.unified_msg_origin
+        conversation = await LLMUtils.get_native_conversation(event, context)
+        if conversation is not None:
+            logger.debug(f"使用 AstrBot 原生会话上下文: umo={umo}")
+        else:
+            system_prompt, contexts = await LLMUtils.build_legacy_persona_context(
+                context,
+                umo,
+            )
+
         # 构建环境描述（注入到 system_prompt，不污染 prompt）
         env_description = f"\n\n你正在浏览聊天软件，你在聊天软件上的id是{event.get_self_id()}"
 
@@ -205,27 +280,36 @@ class LLMUtils:
         # 添加历史记录（文本格式，注入到 system_prompt）
         # 注意：基于 message_id 精确排除当前消息，避免重复
         history_limit = config.get("group_msg_history", 10)
-        history_messages = HistoryStorage.get_history(platform_name, is_private, chat_id)
-
         try:
-            if history_messages:
-                # 获取当前消息的 message_id 用于精确排除
-                current_msg_id = getattr(event.message_obj, 'message_id', None) if hasattr(event, 'message_obj') else None
-                if current_msg_id:
-                    history_for_context = [m for m in history_messages if getattr(m, 'message_id', None) != current_msg_id]
-                else:
-                    # 回退到排除最后一条
-                    history_for_context = history_messages[:-1] if len(history_messages) > 1 else []
-                if history_for_context:
-                    formatted_history = await MessageUtils.format_history_for_llm(history_for_context, max_messages=history_limit, umo=umo)
-                    env_description += "\n\n以下是最近的聊天记录：\n" + formatted_history
+            history_limit = int(history_limit)
+        except (TypeError, ValueError):
+            history_limit = 10
+
+        history_messages = []
+        current_msg_id = getattr(event.message_obj, 'message_id', None) if hasattr(event, 'message_obj') else None
+        if history_limit > 0:
+            history_messages = HistoryStorage.get_history(platform_name, is_private, chat_id)
+
+            try:
+                if conversation is not None:
+                    logger.debug("已跳过影芯自带聊天记录注入，改用 AstrBot 原生 conversation history")
+                elif history_messages:
+                    # 获取当前消息的 message_id 用于精确排除
+                    if current_msg_id:
+                        history_for_context = [m for m in history_messages if getattr(m, 'message_id', None) != current_msg_id]
+                    else:
+                        # 回退到排除最后一条
+                        history_for_context = history_messages[:-1] if len(history_messages) > 1 else []
+                    if history_for_context:
+                        formatted_history = await MessageUtils.format_history_for_llm(history_for_context, max_messages=history_limit, umo=umo)
+                        env_description += "\n\n以下是最近的聊天记录：\n" + formatted_history
+                    else:
+                        env_description += "\n\n你没看见任何聊天记录，看来最近没有消息。"
                 else:
                     env_description += "\n\n你没看见任何聊天记录，看来最近没有消息。"
-            else:
+            except Exception as e:
+                logger.error(f"获取或格式化历史记录失败: {e}")
                 env_description += "\n\n你没看见任何聊天记录，看来最近没有消息。"
-        except Exception as e:
-            logger.error(f"获取或格式化历史记录失败: {e}")
-            env_description += "\n\n你没看见任何聊天记录，看来最近没有消息。"
 
         # 行为指引
         env_description += "\n(在聊天记录中，你的用户名以AstrBot被代替了)"
@@ -254,12 +338,22 @@ class LLMUtils:
                         logger.warning(f"处理当前消息图片URL时出错: {e}")
                         continue
 
+            quoted_image_urls = await LLMUtils.collect_quoted_image_urls(event)
+            for url in quoted_image_urls:
+                if url and url not in image_urls:
+                    image_urls.append(url)
+            if quoted_image_urls:
+                system_prompt += f"\n\n当前消息引用了{len(quoted_image_urls)}张图片，已经作为本轮视觉输入提供给你。"
+
         # 然后从历史消息中补充收集图片（受 image_count 限制）
         history_image_count = config.get("image_processing", {}).get("image_count", 0)
         if history_image_count and history_messages:
             messages_to_show = history_messages[-history_limit:] if len(history_messages) > history_limit else history_messages
+            history_image_added = 0
 
             for message in reversed(messages_to_show):
+                if current_msg_id and getattr(message, 'message_id', None) == current_msg_id:
+                    continue
                 if hasattr(message, "message") and message.message:
                     for component in message.message:
                         if isinstance(component, Image):
@@ -267,16 +361,17 @@ class LLMUtils:
                                 url = component.file or component.url
                                 if url and url not in image_urls:
                                     image_urls.append(url)
-                                    if len(image_urls) >= history_image_count:
+                                    history_image_added += 1
+                                    if history_image_added >= history_image_count:
                                         break
                             except Exception as e:
                                 logger.warning(f"处理历史消息图片URL时出错: {e}")
                                 continue
-                    if len(image_urls) >= history_image_count:
+                    if history_image_added >= history_image_count:
                         break
 
-            if image_urls:
-                system_prompt += f"\n\n已经按照从晚到早的顺序为你提供了聊天记录中的{len(image_urls)}张图片，你可以直接查看并理解它们。这些图片出现在聊天记录中。"
+            if history_image_added:
+                system_prompt += f"\n\n已经按照从晚到早的顺序为你提供了聊天记录中的{history_image_added}张图片，你可以直接查看并理解它们。这些图片出现在聊天记录中。"
 
         # prompt 只保留用户当前消息，使用 MessageUtils 确保图片被转述
         if hasattr(event, "message_obj") and hasattr(event.message_obj, "message"):
@@ -290,6 +385,7 @@ class LLMUtils:
             contexts=contexts,
             system_prompt=system_prompt,
             image_urls=image_urls,
+            conversation=conversation,
         )
     
     @staticmethod
