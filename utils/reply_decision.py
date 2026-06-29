@@ -27,10 +27,21 @@ class ReplyDecision:
             platform_name = event.get_platform_name()
             is_private_chat = event.is_private_chat()
             chat_id = event.get_sender_id() if is_private_chat else event.get_group_id()
+            sender_id = event.get_sender_id()
             
-            # 检查是否已有大模型在处理
-            if LLMUtils.is_llm_in_progress(platform_name, is_private_chat, chat_id):
-                logger.debug(f"当前聊天已有大模型处理中，不进行回复")
+            # 检查当前发送者是否已有大模型在处理。群聊按发送者隔离，避免 A 的回复挡住 B。
+            if LLMUtils.is_llm_in_progress(
+                platform_name,
+                is_private_chat,
+                chat_id,
+                sender_id=sender_id,
+            ):
+                if is_private_chat:
+                    logger.debug(f"当前私聊已有大模型处理中，不进行回复: sender={sender_id}")
+                else:
+                    logger.debug(
+                        f"当前群聊发送者已有大模型处理中，不进行回复: group={chat_id}, sender={sender_id}"
+                    )
                 return False
             
             # 检查是否处于临时静默状态
@@ -190,13 +201,25 @@ class ReplyDecision:
         platform_name = event.get_platform_name()
         is_private = event.is_private_chat()
         chat_id = event.get_sender_id() if is_private else event.get_group_id()
+        sender_id = event.get_sender_id()
 
         # 标记开始处理
-        LLMUtils.set_llm_in_progress(platform_name, is_private, chat_id)
+        LLMUtils.set_llm_in_progress(
+            platform_name,
+            is_private,
+            chat_id,
+            sender_id=sender_id,
+        )
 
         try:
             # 调用大模型并发送回复
             yield await LLMUtils.call_llm(event, config, context)
         finally:
             # 标记处理完成
-            LLMUtils.set_llm_in_progress(platform_name, is_private, chat_id, False)
+            LLMUtils.set_llm_in_progress(
+                platform_name,
+                is_private,
+                chat_id,
+                False,
+                sender_id=sender_id,
+            )

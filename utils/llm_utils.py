@@ -14,13 +14,18 @@ class LLMUtils:
     用于构建提示词和调用记录相关功能
     """
     
-    # 使用字典保存每个聊天的大模型调用状态
-    # 格式: {"{platform_name}_{chat_type}_{chat_id}": {"last_call_time": timestamp, "in_progress": True/False}}
+    # 使用字典保存每个聊天的大模型调用状态。
+    # 私聊按会话隔离，群聊优先按“群 + 发送者”隔离，避免同群不同成员互相阻塞。
     _llm_call_status: Dict[str, Dict[str, Any]] = {}
     _lock = threading.Lock()  # 用于线程安全的锁
     
     @staticmethod
-    def get_chat_key(platform_name: str, is_private_chat: bool, chat_id: str) -> str:
+    def get_chat_key(
+        platform_name: str,
+        is_private_chat: bool,
+        chat_id: str,
+        sender_id: str | None = None,
+    ) -> str:
         """
         获取聊天的唯一标识
         
@@ -28,15 +33,24 @@ class LLMUtils:
             platform_name: 平台名称
             is_private_chat: 是否为私聊
             chat_id: 聊天ID
+            sender_id: 群聊发送者ID。群聊传入时按发送者隔离处理中状态。
             
         Returns:
             聊天的唯一标识
         """
         chat_type = "private" if is_private_chat else "group"
+        if not is_private_chat and sender_id:
+            return f"{platform_name}_{chat_type}_{chat_id}_{sender_id}"
         return f"{platform_name}_{chat_type}_{chat_id}"
     
     @staticmethod
-    def set_llm_in_progress(platform_name: str, is_private_chat: bool, chat_id: str, in_progress: bool = True) -> None:
+    def set_llm_in_progress(
+        platform_name: str,
+        is_private_chat: bool,
+        chat_id: str,
+        in_progress: bool = True,
+        sender_id: str | None = None,
+    ) -> None:
         """
         设置大模型调用状态
         
@@ -45,8 +59,14 @@ class LLMUtils:
             is_private_chat: 是否为私聊
             chat_id: 聊天ID
             in_progress: 是否正在进行大模型调用
+            sender_id: 群聊发送者ID。群聊传入时按发送者隔离处理中状态。
         """
-        chat_key = LLMUtils.get_chat_key(platform_name, is_private_chat, chat_id)
+        chat_key = LLMUtils.get_chat_key(
+            platform_name,
+            is_private_chat,
+            chat_id,
+            sender_id,
+        )
         
         with LLMUtils._lock:
             if chat_key not in LLMUtils._llm_call_status:
@@ -56,7 +76,12 @@ class LLMUtils:
             LLMUtils._llm_call_status[chat_key]["last_call_time"] = time.time()
     
     @staticmethod
-    def is_llm_in_progress(platform_name: str, is_private_chat: bool, chat_id: str) -> bool:
+    def is_llm_in_progress(
+        platform_name: str,
+        is_private_chat: bool,
+        chat_id: str,
+        sender_id: str | None = None,
+    ) -> bool:
         """
         检查指定聊天是否正在进行大模型调用
         
@@ -64,11 +89,17 @@ class LLMUtils:
             platform_name: 平台名称
             is_private_chat: 是否为私聊
             chat_id: 聊天ID
+            sender_id: 群聊发送者ID。群聊传入时按发送者隔离处理中状态。
             
         Returns:
             是否正在进行大模型调用
         """
-        chat_key = LLMUtils.get_chat_key(platform_name, is_private_chat, chat_id)
+        chat_key = LLMUtils.get_chat_key(
+            platform_name,
+            is_private_chat,
+            chat_id,
+            sender_id,
+        )
         
         with LLMUtils._lock:
             if chat_key not in LLMUtils._llm_call_status:
@@ -77,7 +108,12 @@ class LLMUtils:
             return LLMUtils._llm_call_status[chat_key].get("in_progress", False)
     
     @staticmethod
-    def get_last_call_time(platform_name: str, is_private_chat: bool, chat_id: str) -> Optional[float]:
+    def get_last_call_time(
+        platform_name: str,
+        is_private_chat: bool,
+        chat_id: str,
+        sender_id: str | None = None,
+    ) -> Optional[float]:
         """
         获取指定聊天最后一次大模型调用的时间戳
         
@@ -85,11 +121,17 @@ class LLMUtils:
             platform_name: 平台名称
             is_private_chat: 是否为私聊
             chat_id: 聊天ID
+            sender_id: 群聊发送者ID。群聊传入时按发送者隔离处理中状态。
             
         Returns:
             最后一次调用的时间戳，如果从未调用过则返回None
         """
-        chat_key = LLMUtils.get_chat_key(platform_name, is_private_chat, chat_id)
+        chat_key = LLMUtils.get_chat_key(
+            platform_name,
+            is_private_chat,
+            chat_id,
+            sender_id,
+        )
         
         with LLMUtils._lock:
             if chat_key not in LLMUtils._llm_call_status:
@@ -389,7 +431,12 @@ class LLMUtils:
         )
     
     @staticmethod
-    def clear_call_status(platform_name: str, is_private_chat: bool, chat_id: str) -> None:
+    def clear_call_status(
+        platform_name: str,
+        is_private_chat: bool,
+        chat_id: str,
+        sender_id: str | None = None,
+    ) -> None:
         """
         清除指定聊天的大模型调用状态
         
@@ -397,8 +444,14 @@ class LLMUtils:
             platform_name: 平台名称
             is_private_chat: 是否为私聊
             chat_id: 聊天ID
+            sender_id: 群聊发送者ID。群聊传入时按发送者隔离处理中状态。
         """
-        chat_key = LLMUtils.get_chat_key(platform_name, is_private_chat, chat_id)
+        chat_key = LLMUtils.get_chat_key(
+            platform_name,
+            is_private_chat,
+            chat_id,
+            sender_id,
+        )
         
         with LLMUtils._lock:
             if chat_key in LLMUtils._llm_call_status:
